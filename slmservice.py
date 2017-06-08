@@ -42,6 +42,7 @@ logging.basicConfig(level=logging.INFO,
                     filemode='w')
 
 
+@Pyro4.expose
 class SpatialLightModulator(object):
     def __init__(self):
         # Logging
@@ -114,7 +115,7 @@ class SpatialLightModulator(object):
         pitches = {w: w / (1000. * sin(self.sim_diffraction_angle * TWO_PI / 360.))
                      for w in wavelengths}
         ## Figure out the LUTs we need for each wavelength, once.
-        luts = {w: self.get_lut(w) for w in wavelengths}
+        luts = {w: self.get_lut(w) for w in set(wavelengths)}
 
         # retardation for equal powers in 0 and combined +/-1 orders
         modulation = 65535 * 250.5 / 360
@@ -197,6 +198,7 @@ class SpatialLightModulator(object):
 
             wavelength = int(match.groupdict()['wavelength'])
             self.calibs[wavelength] = calib_data
+            # TODO: use the flatness calibration somewhere.
             self.logger.info("\tloaded data from %s." % f)
 
         ## Find lookup table files.        
@@ -243,6 +245,64 @@ class SpatialLightModulator(object):
         return None
 
 
+    def set_test_sequence(self):
+        """ Generate a series of test images. """
+        from PIL import Image, ImageDraw, ImageFont
+        sequence = []
+        labels = range(15)
+        lut = self.get_lut(550)
+        imsize = self.pixels
+        font = ImageFont.truetype('arial.ttf', imsize[0]/2)
+        for c in labels:
+            image = Image.new('L', imsize)
+            draw = ImageDraw.Draw(image)
+            draw.setink(255)
+            draw.text((128,0), str(c), font=font)
+            pattern16 = numpy.array(image.getdata(), 
+                                    dtype=numpy.ushort).reshape(imsize)
+            pattern16 *= (65535 * 123.9 / 360) / pattern16.max()
+            pattern = lut[pattern16 / 4]
+            # Append to the sequence.
+            sequence.append(pattern)
+        self.sequence_parameters = map(lambda x: (x, 0, 0), labels)
+        self.sequence = sequence
+        self.load_sequence()
+
+    def get_shape(self):
+        """ Return the device shape in pixels. """
+        return self.pixels
+
+
+    def set_custom_sequence(self, wavelengths, patterns):
+        """ Generate sequence from given wavelengths and patterns.
+
+        Accepts:
+          single wavelength, N patterns;
+          N wavelengths, N patterns
+
+        Patterns should be arrays of 16-bit unsigned integers; they will be
+        reshaped to the device size, which can be queried with get_shape().
+        """
+        if type(wavelengths) in [list, tuple]:
+            assert len(wavelengths) == len(patterns), \
+                "len(wavelengths) != len(patterns)."
+        else:
+            wavelengths = len(patterns) * [wavelengths]
+        # Determine LUT once for each wavelength.
+        luts = {w: self.get_lut(w) for w in set(wavelengths)}
+        # Generate the sequence.
+        sequence = []
+        for (w, p) in zip(wavelengths, patterns):
+            # Cast and reshape provided pattern.
+            pattern16 = numpy.array(p, dtype=numpy.ushort).reshape(self.pixels)
+            # Lose two LSBs and pass through the LUT for given wavelength.
+            pattern = luts[w][pattern16 / 4]
+            # Append to the sequence.
+            sequence.append(pattern)
+        # Load sequence to the hardware.
+        self.load_sequence()
+
+
     def run(self):
         """ Power on and make device respond to triggers. """
         self.hardware.power = True
@@ -266,7 +326,10 @@ class SpatialLightModulator(object):
 
 
     def get_current_image_index(self):
-        return self.hardware.curr_seq_image
+        index = self.hardware.curr_seq_image
+        # Index is actually that of the image that will be displayed
+        # on the next trigger.
+        return index - 1 if index > 0 else len(self.sequence) - 1
 
 
     def get_sim_diffraction_angle(self):
